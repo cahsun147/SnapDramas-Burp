@@ -298,7 +298,7 @@ def _rebuild_message(helpers, original_message, new_body, isRequest):
 # Burp editor tab
 # ---------------------------------------------------------------------------
 
-class SnapTab(object, IMessageEditorTab):
+class SnapTab(IMessageEditorTab):
     def __init__(self, extender, controller, editable):
         self.extender = extender
         self.helpers = extender.helpers
