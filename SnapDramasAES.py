@@ -1,43 +1,34 @@
 # SnapDramas Burp Extension
 #
-# Jython Burp extension for SnapDramas traffic.
-# Features:
-# - AES/ECB/PKCS5Padding decrypt/encrypt
-# - Base64 transport
-# - Burp message editor tab for viewing/editing plaintext JSON
-# - Request/response support
+# Burp Suite Jython extension for SnapDramas traffic.
+# - AES/ECB/PKCS5Padding + Base64
+# - Decrypt request/response bodies in a custom editor tab
+# - Edit plaintext, then re-encrypt on send
 #
-# Notes:
-# - Compatible with Jython 2.7 in Burp.
-# - Does not depend on org.json.
-# - If a message is not recognized as SnapDramas encrypted payload, the tab stays disabled.
+# Compatible with Jython 2.7 in Burp.
 
 from burp import IBurpExtender, IMessageEditorTabFactory, IMessageEditorTab, ITab
 from javax.crypto import Cipher
 from javax.crypto.spec import SecretKeySpec
 from java.util import Base64
 from java.lang import String
-from java.awt import BorderLayout, FlowLayout
-from javax.swing import JPanel, JLabel, JScrollPane, JTextArea, JButton, JCheckBox, JSeparator
-from javax.swing import JOptionPane
-from java.awt import Dimension
-from java.awt.event import ActionListener
+from java.awt import BorderLayout, FlowLayout, Dimension
+from javax.swing import JPanel, JLabel, JScrollPane, JTextArea, JButton, JCheckBox
 from java.io import PrintWriter
-from java.lang import Exception as JavaException
 import re
 
 
 KEY = "ipB7OHxAmJ9Qa1Lf38X1bP71zJMe4Yw6"
 TRANSFORMATION = "AES/ECB/PKCS5Padding"
 TAB_NAME = "SnapDramas AES"
-JSON_FIELD = "data"
+DATA_FIELD = "data"
 
 
 # ---------------------------------------------------------------------------
-# Small utility helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _to_str(value):
+def _to_text(value):
     if value is None:
         return None
     try:
@@ -49,25 +40,14 @@ def _to_str(value):
             return None
 
 
-def _strip_non_base64(value):
-    if value is None:
-        return None
-    text = _to_str(value)
+def _clean_b64(value):
+    text = _to_text(value)
     if text is None:
         return None
     return re.sub(r"[^A-Za-z0-9+/=]", "", text).strip()
 
 
-def _looks_like_json(text):
-    if text is None:
-        return False
-    t = text.strip()
-    return (t.startswith('{') and t.endswith('}')) or (t.startswith('[') and t.endswith(']'))
-
-
-def _unescape_json_string(s):
-    # Minimal JSON-string unescape for content inside double quotes.
-    # Enough for common payloads used by this extension.
+def _json_unescape(s):
     if s is None:
         return None
     s = s.replace('\\\\', '\\')
@@ -81,7 +61,7 @@ def _unescape_json_string(s):
     return s
 
 
-def _escape_json_string(s):
+def _json_escape(s):
     if s is None:
         return None
     s = s.replace('\\', '\\\\')
@@ -94,27 +74,21 @@ def _escape_json_string(s):
     return s
 
 
-def _pretty_json_minimal(text):
-    """Pretty-print by preserving the body as text if JSON parsing is unavailable.
-
-    We deliberately avoid org.json / Python json to remain compatible with Burp's
-    Jython runtime. This function normalizes whitespace lightly and leaves the
-    content readable without full parsing.
-    """
+def _pretty_json(text):
     if text is None:
         return None
-    t = _to_str(text)
+    t = _to_text(text)
     if t is None:
         return None
-    if not _looks_like_json(t):
+    t = t.strip()
+    if not t.startswith('{') and not t.startswith('['):
         return t
 
-    # A lightweight formatter that inserts indentation around common JSON syntax.
-    # It is intentionally conservative.
     out = []
     indent = 0
     in_string = False
     escape = False
+
     for ch in t:
         if escape:
             out.append(ch)
@@ -156,13 +130,9 @@ def _pretty_json_minimal(text):
         if ch in ['\r', '\n', '\t']:
             continue
         out.append(ch)
-    pretty = ''.join(out)
-    return pretty
 
+    return ''.join(out)
 
-# ---------------------------------------------------------------------------
-# AES helpers
-# ---------------------------------------------------------------------------
 
 def _aes_cipher(mode):
     cipher = Cipher.getInstance(TRANSFORMATION)
@@ -184,7 +154,7 @@ def encrypt_text(plaintext):
 def decrypt_text(ciphertext_b64):
     if ciphertext_b64 is None:
         return None
-    cleaned = _strip_non_base64(ciphertext_b64)
+    cleaned = _clean_b64(ciphertext_b64)
     if cleaned is None or cleaned == "":
         return None
     cipher = _aes_cipher(Cipher.DECRYPT_MODE)
@@ -194,108 +164,71 @@ def decrypt_text(ciphertext_b64):
 
 
 # ---------------------------------------------------------------------------
-# JSON body helpers (no org.json)
+# Simple SnapDramas JSON parsing
 # ---------------------------------------------------------------------------
 
-def _find_data_field(body):
-    """Extract the value of top-level JSON field "data".
-
-    Supports only the common SnapDramas payload structure:
-      {"data":"..."}
-    If the body is not a matching JSON object, returns None.
-    """
+def _extract_data_field(body):
+    """Extract the value of top-level JSON field data from {\"data\":\"...\"}."""
     if body is None:
         return None
-    text = _to_str(body)
+    text = _to_text(body)
     if text is None:
         return None
     t = text.strip()
-    if not t.startswith('{') or '"data"' not in t:
+    if not t.startswith('{'):
+        return None
+    if '"data"' not in t:
         return None
 
-    # Simple robust scan for top-level "data":"..."
-    # We avoid full JSON parsing to remain Jython-compatible.
-    key_pat = '"%s"' % JSON_FIELD
-    idx = t.find(key_pat)
-    if idx < 0:
+    m = re.search(r'"data"\s*:\s*"((?:\\.|[^"\\])*)"', t, re.S)
+    if not m:
         return None
-
-    # Find the colon after the key
-    colon = t.find(':', idx + len(key_pat))
-    if colon < 0:
-        return None
-
-    # Skip whitespace
-    i = colon + 1
-    while i < len(t) and t[i] in ' \r\n\t':
-        i += 1
-    if i >= len(t):
-        return None
-
-    # Expect string value
-    if t[i] != '"':
-        # For non-string values, capture a simple token until comma/closing brace.
-        j = i
-        while j < len(t) and t[j] not in ',}':
-            j += 1
-        val = t[i:j].strip()
-        return _unescape_json_string(val)
-
-    # Parse quoted string with escaping
-    j = i + 1
-    escape = False
-    buf = []
-    while j < len(t):
-        ch = t[j]
-        if escape:
-            buf.append(ch)
-            escape = False
-        elif ch == '\\':
-            buf.append(ch)
-            escape = True
-        elif ch == '"':
-            return _unescape_json_string(''.join(buf))
-        else:
-            buf.append(ch)
-        j += 1
-    return None
+    return _json_unescape(m.group(1))
 
 
 def _build_data_body(ciphertext_b64):
-    return '{"%s":"%s"}' % (JSON_FIELD, _escape_json_string(ciphertext_b64))
+    return '{"%s":"%s"}' % (DATA_FIELD, _json_escape(ciphertext_b64))
 
 
 # ---------------------------------------------------------------------------
-# Message body handling
+# Burp message helpers
 # ---------------------------------------------------------------------------
 
-def _get_body_from_message(helpers, content, isRequest):
-    if content is None:
-        return None, None, None
-    info = helpers.analyzeRequest(content) if isRequest else helpers.analyzeResponse(content)
-    body_offset = info.getBodyOffset()
-    body_bytes = content[body_offset:]
-    body = helpers.bytesToString(body_bytes)
-    return info, body_offset, body
+def _message_info(helpers, content, is_request):
+    if is_request:
+        return helpers.analyzeRequest(content)
+    return helpers.analyzeResponse(content)
 
 
-def _rebuild_message(helpers, original_message, new_body, isRequest):
-    info = helpers.analyzeRequest(original_message) if isRequest else helpers.analyzeResponse(original_message)
-    headers = list(info.getHeaders())
+def _get_body(helpers, content, is_request):
+    info = _message_info(helpers, content, is_request)
+    offset = info.getBodyOffset()
+    body = helpers.bytesToString(content[offset:])
+    return info, offset, body
 
-    # Remove stale Content-Length; buildHttpMessage computes it.
-    filtered = []
-    for h in headers:
+
+def _rebuild_message(helpers, original_message, new_body, is_request):
+    info = _message_info(helpers, original_message, is_request)
+    headers = []
+    for h in info.getHeaders():
         if h.lower().startswith('content-length:'):
             continue
-        filtered.append(h)
+        headers.append(h)
+    return helpers.buildHttpMessage(headers, helpers.stringToBytes(new_body))
 
-    body_bytes = helpers.stringToBytes(new_body)
-    return helpers.buildHttpMessage(filtered, body_bytes)
+
+def _looks_like_snap_payload(body):
+    if body is None:
+        return False
+    t = _to_text(body)
+    if t is None:
+        return False
+    t = t.strip()
+    return t.startswith('{') and '"data"' in t
 
 
 # ---------------------------------------------------------------------------
-# Burp editor tab
+# Tab editor
 # ---------------------------------------------------------------------------
 
 class SnapTab(IMessageEditorTab):
@@ -306,21 +239,16 @@ class SnapTab(IMessageEditorTab):
         self.editable = editable
         self.current_message = None
         self.current_plain = None
-        self.current_ciphertext = None
-        self.is_request = False
-        self.compatible = False
-        self.modified_once = False
+        self.current_cipher = None
+        self.current_is_request = False
+        self.enabled_for_message = False
 
         self.text = JTextArea()
         self.text.setLineWrap(True)
         self.text.setWrapStyleWord(True)
         self.text.setEditable(editable)
-        self.text.setTabSize(2)
         self.component = JScrollPane(self.text)
-        self.component.setPreferredSize(Dimension(900, 600))
-
-        # Optional small status indicator for debugging.
-        self._last_mode = None
+        self.component.setPreferredSize(Dimension(1000, 650))
 
     def getTabCaption(self):
         return TAB_NAME
@@ -332,17 +260,16 @@ class SnapTab(IMessageEditorTab):
         if content is None:
             return False
         try:
-            info, _, body = _get_body_from_message(self.helpers, content, isRequest)
+            _, _, body = _get_body(self.helpers, content, isRequest)
             if body is None:
                 return False
             t = body.strip()
             if not t:
                 return False
-            # Expected wrapped payload: {"data":"BASE64..."}
-            if t.startswith('{') and '"data"' in t:
+            if _looks_like_snap_payload(t):
                 return True
-            # Also allow plain base64 body for compatibility.
-            if len(_strip_non_base64(t) or '') > 0:
+            # Allow raw base64 bodies too.
+            if _clean_b64(t):
                 return True
             return False
         except Exception:
@@ -350,68 +277,66 @@ class SnapTab(IMessageEditorTab):
 
     def setMessage(self, content, isRequest):
         self.current_message = content
-        self.is_request = isRequest
-        self.compatible = False
+        self.current_is_request = isRequest
         self.current_plain = None
-        self.current_ciphertext = None
-        self.modified_once = False
-        self._last_mode = 'request' if isRequest else 'response'
+        self.current_cipher = None
+        self.enabled_for_message = False
         self.text.setText("")
 
         if content is None:
             return
 
         try:
-            _, _, body = _get_body_from_message(self.helpers, content, isRequest)
+            _, _, body = _get_body(self.helpers, content, isRequest)
             if body is None:
-                self.text.setText("")
                 return
 
             raw = body.strip()
-            ciphertext = None
-            if raw.startswith('{') and '"data"' in raw:
-                ciphertext = _find_data_field(raw)
+            if not raw:
+                return
+
+            cipher_text = None
+            if _looks_like_snap_payload(raw):
+                cipher_text = _extract_data_field(raw)
             else:
-                ciphertext = raw
+                cipher_text = raw
 
-            if ciphertext is None:
+            if cipher_text is None:
                 self.text.setText(raw)
                 return
 
-            plaintext = decrypt_text(ciphertext)
-            if plaintext is None:
+            plain = decrypt_text(cipher_text)
+            if plain is None:
                 self.text.setText(raw)
                 return
 
-            self.compatible = True
-            self.current_ciphertext = ciphertext
-            self.current_plain = plaintext
-            display = _pretty_json_minimal(plaintext)
-            self.text.setText(display if display is not None else plaintext)
+            self.enabled_for_message = True
+            self.current_cipher = cipher_text
+            self.current_plain = plain
+            self.text.setText(_pretty_json(plain))
             self.text.setCaretPosition(0)
         except Exception as e:
-            self.text.setText("[decrypt error] %s" % str(e))
+            self.text.setText('[decrypt error] %s' % str(e))
 
     def getMessage(self):
-        if not self.editable or not self.compatible:
+        if not self.editable or not self.enabled_for_message:
             return self.current_message
 
         try:
             edited_plain = self.text.getText()
             if edited_plain is None:
                 return self.current_message
+
             edited_plain = String(edited_plain).toString().strip()
             if edited_plain == "":
                 return self.current_message
 
-            ciphertext = encrypt_text(edited_plain)
-            if ciphertext is None:
+            new_cipher = encrypt_text(edited_plain)
+            if new_cipher is None:
                 return self.current_message
 
-            new_body = _build_data_body(ciphertext)
-            rebuilt = _rebuild_message(self.helpers, self.current_message, new_body, self.is_request)
-            self.modified_once = True
-            return rebuilt
+            new_body = _build_data_body(new_cipher)
+            return _rebuild_message(self.helpers, self.current_message, new_body, self.current_is_request)
         except Exception:
             return self.current_message
 
@@ -422,9 +347,10 @@ class SnapTab(IMessageEditorTab):
             current = self.text.getText()
             if current is None:
                 return False
+            current = current.strip()
             if self.current_plain is None:
-                return len(current.strip()) > 0
-            return String(current).toString().strip() != String(_pretty_json_minimal(self.current_plain)).toString().strip()
+                return len(current) > 0
+            return current != _pretty_json(self.current_plain).strip()
         except Exception:
             return False
 
@@ -433,7 +359,7 @@ class SnapTab(IMessageEditorTab):
 
 
 # ---------------------------------------------------------------------------
-# Main Burp extender
+# Extension UI
 # ---------------------------------------------------------------------------
 
 class SnapDramasBurpExtender(IBurpExtender, IMessageEditorTabFactory, ITab):
@@ -442,17 +368,15 @@ class SnapDramasBurpExtender(IBurpExtender, IMessageEditorTabFactory, ITab):
         self.helpers = callbacks.getHelpers()
         self.stdout = PrintWriter(callbacks.getStdout(), True)
         self.stderr = PrintWriter(callbacks.getStderr(), True)
-        self.enabled = True
 
-        callbacks.setExtensionName("SnapDramas AES")
+        callbacks.setExtensionName('SnapDramas AES')
         callbacks.registerMessageEditorTabFactory(self)
-        callbacks.addSuiteTab(self)
-        self.panel = self._build_panel()
 
-        self._log("Loaded SnapDramas AES extension")
-        self._log("Algorithm: %s" % TRANSFORMATION)
-        self._log("Key: %s" % KEY)
-        self._log("Expected body format: {\"data\":\"...\"}")
+        self.panel = self._build_panel()
+        callbacks.addSuiteTab(self)
+        self._log('SnapDramas AES loaded')
+        self._log('Transformation: %s' % TRANSFORMATION)
+        self._log('Key loaded')
 
     def createNewInstance(self, controller, editable):
         return SnapTab(self, controller, editable)
@@ -467,74 +391,50 @@ class SnapDramasBurpExtender(IBurpExtender, IMessageEditorTabFactory, ITab):
         panel = JPanel(BorderLayout())
 
         top = JPanel(FlowLayout(FlowLayout.LEFT))
-        top.add(JLabel("SnapDramas AES Burp Extension"))
+        top.add(JLabel('SnapDramas AES Extension'))
         panel.add(top, BorderLayout.NORTH)
 
-        self.log_area = JTextArea(20, 100)
+        self.log_area = JTextArea(18, 100)
         self.log_area.setEditable(False)
         self.log_area.setLineWrap(True)
         self.log_area.setWrapStyleWord(True)
         panel.add(JScrollPane(self.log_area), BorderLayout.CENTER)
 
         bottom = JPanel(FlowLayout(FlowLayout.LEFT))
-        self.chk_enabled = JCheckBox("Enabled", True)
-        self.chk_enabled.addActionListener(self._toggle_enabled)
-        bottom.add(self.chk_enabled)
+        self.chk = JCheckBox('Enabled', True)
+        self.chk.addActionListener(self._toggle_enabled)
+        bottom.add(self.chk)
 
-        btn_key = JButton("Show Key")
+        btn_key = JButton('Show Key')
         btn_key.addActionListener(self._show_key)
         bottom.add(btn_key)
 
-        btn_clear = JButton("Clear Log")
+        btn_clear = JButton('Clear Log')
         btn_clear.addActionListener(self._clear_log)
         bottom.add(btn_clear)
-
-        btn_test = JButton("Test Encrypt/Decrypt")
-        btn_test.addActionListener(self._self_test)
-        bottom.add(btn_test)
 
         panel.add(bottom, BorderLayout.SOUTH)
         return panel
 
     def _toggle_enabled(self, event):
-        try:
-            self.enabled = self.chk_enabled.isSelected()
-            self._log("Enabled = %s" % str(self.enabled))
-        except Exception as e:
-            self._log("Toggle error: %s" % str(e))
+        self._log('Enabled = %s' % str(self.chk.isSelected()))
 
     def _show_key(self, event):
-        self._log("AES key: %s" % KEY)
-        self._log("Transformation: %s" % TRANSFORMATION)
+        self._log('AES key: %s' % KEY)
+        self._log('Algorithm: %s' % TRANSFORMATION)
 
     def _clear_log(self, event):
         try:
-            self.log_area.setText("")
+            self.log_area.setText('')
         except Exception:
             pass
 
-    def _self_test(self, event):
+    def _log(self, msg):
         try:
-            sample = '{"pageNum":1,"pageSize":20,"sort":2,"subtitleLang":"id"}'
-            enc = encrypt_text(sample)
-            dec = decrypt_text(enc)
-            self._log("Self-test input : %s" % sample)
-            self._log("Self-test enc   : %s" % enc)
-            self._log("Self-test dec   : %s" % dec)
-        except Exception as e:
-            self._log("Self-test error: %s" % str(e))
-
-    def _log(self, text):
-        try:
-            msg = _to_str(text)
-            if msg is None:
-                return
-            self.log_area.append(msg + "\n")
-            self.log_area.setCaretPosition(self.log_area.getDocument().getLength())
-            self.stdout.println(msg)
+            self.log_area.append(str(msg) + '\n')
+            self.stdout.println(str(msg))
         except Exception:
             pass
 
 
-# Burp convention: the extender class must be called BurpExtender.
 BurpExtender = SnapDramasBurpExtender
